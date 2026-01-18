@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autofix-agent"
+version = "1.0.0"
+description = "Claude-powered error monitoring and auto-fixing for FastAPI apps"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Ben Sharpe"}
+]
+keywords = ["fastapi", "error-monitoring", "claude", "ai", "auto-fix", "sentry"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.100.0",
+    "httpx>=0.24.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/uwskiguy/autofix-agent"
+Repository = "https://github.com/uwskiguy/autofix-agent"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["autofix_agent*"]

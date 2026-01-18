@@ -1,4 +1,4 @@
-"""Pydantic schemas for the AutoFix Agent."""
+"""Pydantic schemas for AutoFix Agent."""
 
 from datetime import datetime
 from enum import Enum
@@ -24,8 +24,8 @@ class ProjectConfig(BaseModel):
     """Configuration for a monitored project."""
 
     name: str
-    github_repo: str  # owner/repo format
-    github_path: str = ""  # subfolder in repo (e.g., "backend/")
+    github_repo: str
+    github_path: str = ""
     sentry_project: Optional[str] = None
     slack_channel: Optional[str] = None
 
@@ -94,14 +94,9 @@ class FixAttempt(BaseModel):
     completed_at: Optional[datetime] = None
 
 
-class SlackInteraction(BaseModel):
-    """Parsed Slack interaction payload."""
+class WebhookResponse(BaseModel):
+    """Response to webhooks."""
 
-    type: str  # block_actions, etc.
-    user_id: str
-    user_name: str
-    channel_id: str
-    action_id: str
-    action_value: str  # The fix_attempt_id
-    response_url: str
-    message_ts: str
+    received: bool = True
+    fix_attempt_id: Optional[str] = None
+    message: str

@@ -35,18 +35,10 @@ ENV/
 .env
 .env.local
 
-# Logs
-*.log
-logs/
-
 # Testing
 .coverage
 htmlcov/
 .pytest_cache/
-
-# Local config (keep the example, ignore actual config)
-config/projects.yaml
-!config/projects.yaml.example
 
 # macOS
 .DS_Store
