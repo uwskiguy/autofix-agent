@@ -1,6 +1,21 @@
 # AutoFix Agent
 
-A pip-installable package that adds Claude-powered error monitoring and auto-fixing to your FastAPI app. Errors get analyzed, fixes proposed via Slack, and PRs created on approval - all within your existing deployment.
+Claude-powered error monitoring and auto-fixing for FastAPI apps. Works standalone or as a **runtime companion to Orchestrator**.
+
+## How It Works
+
+```
+Production Error → Sentry → AutoFix → Claude (CTO) Analysis → PR Created → Slack
+                                                                              ↓
+                                                              [🚀 Deploy Live] → Merge → Deploy
+```
+
+1. **Error occurs** in production
+2. **Sentry captures** and sends webhook to AutoFix
+3. **Claude analyzes** as CTO (complexity, security, blast radius)
+4. **PR created** automatically with the fix
+5. **Slack notification** with "Deploy Live" button
+6. **You approve** → PR merges → Auto-deploy via Railway/Vercel/etc.
 
 ## Installation
 
@@ -10,86 +25,146 @@ pip install git+https://github.com/uwskiguy/autofix-agent.git
 
 ## Quick Start
 
-Add 3 lines to your FastAPI app:
-
 ```python
 from fastapi import FastAPI
 from autofix_agent import AutoFixAgent
 
 app = FastAPI()
 
-# Initialize AutoFix with your credentials
 autofix = AutoFixAgent(
     anthropic_api_key="sk-ant-...",
-    github_token="ghp_...",
+    github_token="github_pat_...",
     github_repo="owner/repo",
-    slack_webhook_url="https://hooks.slack.com/services/...",
-    github_path="backend/",  # Optional: subfolder where your code lives
+    github_path="backend/",  # Optional: subfolder containing code
+    slack_webhook_url="https://hooks.slack.com/...",
 )
 
-# Mount the routes
-autofix.mount(app)  # Adds /autofix/* endpoints
+autofix.mount(app, prefix="/api/v1/autofix")
 ```
 
-That's it! Your app now has error monitoring at:
-- `POST /autofix/webhooks/sentry` - Receives Sentry webhooks
-- `POST /autofix/slack/interact` - Handles Slack button clicks
-- `GET /autofix/status` - Check status
-- `GET /autofix/attempts` - List recent fix attempts
+## CTO Analysis Mode
 
-## How It Works
+AutoFix uses Claude as a CTO to analyze every error with Orchestrator-style analysis:
 
+| Analysis | Description |
+|----------|-------------|
+| **Complexity** | minimal, simple, standard, complex |
+| **Security** | none, low, medium, high |
+| **Blast Radius** | isolated, moderate, wide |
+| **Confidence** | 0-100% |
+
+### Auto-Fix Criteria
+
+Auto-fix is **enabled** when ALL conditions are met:
+- Complexity is minimal or simple
+- Security implications are none or low
+- Confidence is ≥80%
+- Single file change
+- Fix is isolated (won't affect other code paths)
+
+Auto-fix is **blocked** for:
+- Security-sensitive code (auth, tokens, encryption, validation)
+- Database queries or migrations
+- External API integrations
+- Business logic requiring product knowledge
+- Multi-file changes
+- Complex issues that could mask deeper problems
+
+Blocked issues appear in Slack as "🔍 Manual Review Required" with full CTO analysis.
+
+## Slack Notifications
+
+### Fix Ready to Deploy
 ```
-[Sentry Error] → [Your App] → [Claude Analysis] → [Slack Notification]
-                                                          ↓
-                                                  [You Click "Approve"]
-                                                          ↓
-                                                  [GitHub PR Created]
+🔧 AutoFix: CTO Review Complete - Ready to Deploy
+
+Error: TypeError
+File: app/api/v1/router.py:55
+
+📊 CTO Analysis
+Complexity: 🟢 Minimal    Security: ✅ None
+Blast Radius: Isolated    Confidence: 95%
+
+🔍 Root Cause: [detailed explanation]
+
+💡 CTO Recommendation: [advice for reviewer]
+
+📋 Pull Request: PR #1
+
+[🚀 Deploy Live]  [❌ Dismiss]
 ```
 
-1. **Error occurs** → Sentry sends webhook to your app
-2. **Claude analyzes** → Identifies root cause, generates fix
-3. **Slack notification** → You see the error + proposed fix
-4. **You approve** → Click "Authorize Fix" button
-5. **PR created** → Fix applied to a branch, PR opened for review
+### Manual Review Required
+```
+🔍 AutoFix: Manual Review Required
+
+📊 CTO Analysis
+Complexity: 🔴 Complex    Security: 🟠 Medium
+...
+
+💡 CTO Recommendation: This requires human review because...
+```
 
 ## Configuration
 
-### Using Environment Variables
+### Environment Variables
 
-```python
-import os
-from autofix_agent import AutoFixAgent
-
-autofix = AutoFixAgent(
-    anthropic_api_key=os.environ["ANTHROPIC_API_KEY"],
-    github_token=os.environ["GITHUB_TOKEN"],
-    github_repo=os.environ.get("GITHUB_REPO", "owner/repo"),
-    slack_webhook_url=os.environ["SLACK_WEBHOOK_URL"],
-
-    # Optional settings
-    github_path="backend/",           # Subfolder in repo
-    slack_channel="#errors",          # Slack channel
-    min_confidence=0.8,               # Min confidence to propose fix (0-1)
-    max_attempts_per_hour=10,         # Rate limit
-)
+```bash
+ANTHROPIC_API_KEY=sk-ant-...          # Claude API key
+AUTOFIX_GITHUB_TOKEN=github_pat_...   # GitHub PAT with repo scope
+AUTOFIX_SLACK_WEBHOOK_URL=https://... # Slack incoming webhook
+SENTRY_WEBHOOK_SECRET=...             # Optional: verify Sentry webhooks
 ```
 
-### Required Environment Variables
+### Sentry Webhook
 
-| Variable | Description |
-|----------|-------------|
-| `ANTHROPIC_API_KEY` | Anthropic API key for Claude |
-| `GITHUB_TOKEN` | GitHub PAT with `repo` scope |
-| `SLACK_WEBHOOK_URL` | Slack incoming webhook URL |
+Configure Sentry to send webhooks to:
+```
+https://your-app.com/api/v1/autofix/webhooks/sentry
+```
 
-### Optional Environment Variables
+Events to enable: `issue.created`
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GITHUB_REPO` | - | Repository in `owner/repo` format |
-| `GITHUB_PATH` | `""` | Subfolder where code lives |
-| `MIN_CONFIDENCE` | `0.8` | Minimum confidence threshold |
+### Slack Interactivity
+
+For the "Deploy Live" button to work, configure Slack interactivity:
+```
+https://your-app.com/api/v1/autofix/slack/interact
+```
+
+## Integration with Orchestrator
+
+AutoFix is designed to work with the [Orchestrator framework](https://github.com/uwskiguy/orchestrator). When both are used:
+
+- **Development time**: Orchestrator coordinates agents for implementation
+- **Runtime**: AutoFix monitors and fixes production errors
+- **Shared philosophy**: Both use the same CTO analysis criteria
+
+Configuration in `.orchestrator/autofix.yaml`:
+
+```yaml
+autofix:
+  enabled: true
+  github:
+    repo: "owner/repo"
+    path: "backend/"
+  cto_analysis:
+    min_confidence: 0.8
+    blocked_categories:
+      - security
+      - database
+      - payments
+```
+
+## API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/autofix/status` | GET | Health check and status |
+| `/autofix/webhooks/sentry` | POST | Receive Sentry webhooks |
+| `/autofix/slack/interact` | POST | Handle Slack button clicks |
+| `/autofix/attempts` | GET | List recent fix attempts |
+| `/autofix/attempts/{id}` | GET | Get specific attempt details |
 
 ## Setup Instructions
 
@@ -100,15 +175,17 @@ autofix = AutoFixAgent(
 3. **Incoming Webhooks**: Enable and create a webhook for your channel
 4. **Interactivity**: Enable and set Request URL to:
    ```
-   https://your-app.railway.app/autofix/slack/interact
+   https://your-app.com/api/v1/autofix/slack/interact
    ```
-5. Copy the webhook URL and signing secret
+5. Copy the webhook URL
 
 ### 2. Create GitHub Token
 
 1. Go to https://github.com/settings/tokens
-2. Generate new token (classic)
-3. Select scope: `repo` (full control)
+2. **Fine-grained token** (recommended):
+   - Repository access: Select your repo
+   - Permissions: Contents (Read/Write), Pull requests (Read/Write)
+3. Or **Classic token** with `repo` scope
 4. Copy the token
 
 ### 3. Configure Sentry Webhook
@@ -116,56 +193,25 @@ autofix = AutoFixAgent(
 1. In Sentry, go to **Settings → Integrations → Webhooks**
 2. Add webhook URL:
    ```
-   https://your-app.railway.app/autofix/webhooks/sentry
+   https://your-app.com/api/v1/autofix/webhooks/sentry
    ```
-3. Enable for: **Issue Created**, **Error**
+3. Enable events: `issue.created`
+4. Copy the webhook secret (optional but recommended)
 
 ### 4. Get Anthropic API Key
 
 1. Go to https://console.anthropic.com/settings/keys
 2. Create a new API key
 
-## Example: JunkGems Integration
+### 5. Set Environment Variables
 
-```python
-# backend/app/main.py
-from fastapi import FastAPI
-from autofix_agent import AutoFixAgent
-
-from app.config import settings
-
-app = FastAPI(title="JunkGems")
-
-# Initialize AutoFix
-autofix = AutoFixAgent(
-    anthropic_api_key=settings.anthropic_api_key,
-    github_token=settings.github_token,
-    github_repo="bensharpe/JunkGems",
-    github_path="backend/",
-    slack_webhook_url=settings.slack_webhook_url,
-)
-
-autofix.mount(app, prefix="/autofix")
-
-# ... rest of your app
+For Railway:
+```bash
+railway variables --set "ANTHROPIC_API_KEY=sk-ant-..."
+railway variables --set "AUTOFIX_GITHUB_TOKEN=github_pat_..."
+railway variables --set "AUTOFIX_SLACK_WEBHOOK_URL=https://hooks.slack.com/..."
+railway variables --set "SENTRY_WEBHOOK_SECRET=..."
 ```
-
-## What Gets Fixed?
-
-**Auto-fixable errors:**
-- Typos in variable/function names
-- Missing null/None checks
-- Wrong variable references
-- Missing imports
-- Simple logic errors
-- Off-by-one errors
-
-**Not auto-fixed (sent to Slack for visibility only):**
-- Architectural issues
-- Security-sensitive code
-- Database schema problems
-- External API changes
-- Missing features
 
 ## API Reference
 
@@ -173,20 +219,22 @@ autofix.mount(app, prefix="/autofix")
 
 ```python
 AutoFixAgent(
-    anthropic_api_key: str,      # Required
-    github_token: str,           # Required
-    github_repo: str,            # Required (owner/repo format)
-    slack_webhook_url: str,      # Required
-    github_path: str = "",       # Optional subfolder
-    slack_channel: str = None,   # Optional channel override
-    min_confidence: float = 0.8, # Minimum confidence (0-1)
-    max_attempts_per_hour: int = 10,
+    anthropic_api_key: str,           # Required: Anthropic API key
+    github_token: str,                # Required: GitHub PAT
+    github_repo: str,                 # Required: owner/repo format
+    slack_webhook_url: str,           # Required: Slack webhook URL
+    github_path: str = "",            # Optional: subfolder in repo
+    slack_channel: str = None,        # Optional: channel override
+    slack_signing_secret: str = None, # Optional: verify Slack requests
+    sentry_webhook_secret: str = None,# Optional: verify Sentry webhooks
+    min_confidence: float = 0.8,      # Minimum confidence (0-1)
+    max_attempts_per_hour: int = 10,  # Rate limit
 )
 ```
 
 ### `autofix.mount(app, prefix="/autofix")`
 
-Mounts the following routes:
+Mounts routes onto your FastAPI app:
 - `POST {prefix}/webhooks/sentry` - Sentry webhook receiver
 - `POST {prefix}/slack/interact` - Slack interaction handler
 - `GET {prefix}/status` - Service status

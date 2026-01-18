@@ -299,8 +299,18 @@ class AutoFixAgent:
                 fix_attempt.failure_reason = "Could not generate fix"
                 return
 
-            # Send to Slack for approval
-            fix_attempt.status = FixStatus.AWAITING_APPROVAL
+            # Automatically create PR
+            pr_url, pr_number = await self._create_pr(fix_attempt)
+            if pr_url:
+                fix_attempt.pr_url = pr_url
+                fix_attempt.pr_number = pr_number
+                fix_attempt.status = FixStatus.AWAITING_APPROVAL
+                logger.info(f"PR created: {pr_url}")
+            else:
+                fix_attempt.status = FixStatus.FAILED
+                fix_attempt.failure_reason = "Failed to create PR"
+
+            # Send to Slack - ask to deploy if PR created, or notify of failure
             await self._send_slack_notification(fix_attempt)
 
         except Exception as e:
@@ -314,7 +324,7 @@ class AutoFixAgent:
         user_name: str,
         response_url: Optional[str],
     ) -> None:
-        """Approve a fix and create PR."""
+        """Approve deployment - merge the PR to deploy live."""
         fix_attempt = self._fix_attempts.get(attempt_id)
         if not fix_attempt or fix_attempt.status != FixStatus.AWAITING_APPROVAL:
             return
@@ -322,16 +332,18 @@ class AutoFixAgent:
         fix_attempt.status = FixStatus.APPROVED
         fix_attempt.approved_at = datetime.utcnow()
 
-        # Create PR
-        pr_url, pr_number = await self._create_pr(fix_attempt)
-
-        if pr_url:
-            fix_attempt.status = FixStatus.PR_CREATED
-            fix_attempt.pr_url = pr_url
-            fix_attempt.pr_number = pr_number
+        # Merge the PR to deploy
+        if fix_attempt.pr_number:
+            merged = await self._merge_pr(fix_attempt.pr_number, user_name)
+            if merged:
+                fix_attempt.status = FixStatus.DEPLOYED
+                logger.info(f"PR #{fix_attempt.pr_number} merged by {user_name}")
+            else:
+                fix_attempt.status = FixStatus.FAILED
+                fix_attempt.failure_reason = "Failed to merge PR"
         else:
             fix_attempt.status = FixStatus.FAILED
-            fix_attempt.failure_reason = "Failed to create PR"
+            fix_attempt.failure_reason = "No PR to merge"
 
         fix_attempt.completed_at = datetime.utcnow()
         await self._send_slack_result(fix_attempt, response_url)
@@ -361,41 +373,71 @@ class AutoFixAgent:
         event_data: SentryEventData,
         source_code: str,
     ) -> ErrorAnalysis:
-        """Analyze error with Claude."""
-        prompt = f"""Analyze this Python error and determine if it can be automatically fixed.
+        """Analyze error with Claude in CTO/Orchestrator mode."""
+        prompt = f"""You are the CTO reviewing a production error. Analyze this thoroughly before recommending any fix.
 
-ERROR:
+## ERROR DETAILS
 - Type: {event_data.exception_type or 'Unknown'}
 - Message: {event_data.exception_value or event_data.message or ''}
 - File: {event_data.file_path or 'Unknown'}
 - Line: {event_data.line_number or 'Unknown'}
 - Function: {event_data.function_name or 'Unknown'}
 
-CONTEXT:
+## CODE CONTEXT
 {chr(10).join(event_data.pre_context)}
 >>> {event_data.context_lines or ''}
 {chr(10).join(event_data.post_context)}
 
-SOURCE FILE:
+## SOURCE FILE
 ```python
 {source_code[:6000] if source_code else 'Not available'}
 ```
+
+## CTO ANALYSIS REQUIRED
+
+Perform a thorough Orchestrator-style analysis:
+
+1. **COMPLEXITY**: Is this minimal/simple/standard/complex?
+2. **ROOT CAUSE**: What exactly caused this error?
+3. **BLAST RADIUS**: What else could be affected by this bug or its fix?
+4. **SECURITY**: Could this error or fix have security implications?
+5. **RISK ASSESSMENT**: What's the risk of auto-fixing vs. manual review?
+
+## DECISION CRITERIA
+
+can_auto_fix = TRUE only if ALL conditions met:
+- Complexity is minimal or simple (single line change, obvious fix)
+- No security implications (not auth, payments, PII, crypto)
+- No database/schema changes required
+- No external API contract changes
+- Fix is isolated (won't affect other code paths)
+- High confidence (>90%) the fix is correct
+
+can_auto_fix = FALSE if ANY of these apply:
+- Architecture or design issues
+- Security-sensitive code (auth, tokens, encryption, validation)
+- Database queries or schema
+- External API integrations
+- Business logic that requires product understanding
+- Multiple files would need changes
+- The fix could mask a deeper problem
 
 RESPOND WITH JSON ONLY:
 {{
     "error_type": "...",
     "error_message": "...",
-    "root_cause": "detailed explanation",
+    "root_cause": "detailed CTO-level explanation of what went wrong",
+    "complexity": "minimal|simple|standard|complex",
+    "security_implications": "none|low|medium|high",
+    "blast_radius": "isolated|moderate|wide",
     "file_path": "{event_data.file_path or ''}",
     "line_number": {event_data.line_number or 'null'},
     "function_name": "{event_data.function_name or ''}",
     "confidence": 0.0 to 1.0,
     "can_auto_fix": true/false,
-    "explanation": "why this can/cannot be auto-fixed"
+    "explanation": "CTO reasoning for why this can/cannot be safely auto-fixed",
+    "recommendation": "Brief recommendation for the human reviewer"
 }}
-
-can_auto_fix = TRUE for: typos, null checks, wrong variable names, missing imports, simple logic errors
-can_auto_fix = FALSE for: architecture issues, new features, security code, DB schema, external APIs
 """
 
         response = await self._call_claude(prompt)
@@ -406,35 +448,48 @@ can_auto_fix = FALSE for: architecture issues, new features, security code, DB s
         analysis: ErrorAnalysis,
         source_code: str,
     ) -> list[ProposedFix]:
-        """Generate fix with Claude."""
-        prompt = f"""Generate a fix for this error.
+        """Generate fix with Claude in CTO mode."""
+        prompt = f"""You are the CTO generating a production fix. Be conservative and precise.
 
-ERROR:
-- Type: {analysis.error_type}
+## CTO ANALYSIS (Already Reviewed)
+- Error: {analysis.error_type}
 - Message: {analysis.error_message}
 - Root Cause: {analysis.root_cause}
 - File: {analysis.file_path}
 - Line: {analysis.line_number}
 
-SOURCE:
+## SOURCE CODE
 ```python
 {source_code}
 ```
+
+## CTO FIX GUIDELINES
+
+1. **MINIMAL CHANGE**: Make the smallest possible fix. One line if possible.
+2. **NO SIDE EFFECTS**: Don't refactor, don't "improve" surrounding code.
+3. **DEFENSIVE**: Add null checks, bounds checks, or validation as needed.
+4. **NO NEW DEPENDENCIES**: Don't add imports unless absolutely required.
+5. **PRESERVE BEHAVIOR**: Fix the bug without changing intended functionality.
+
+## QUALITY CHECKLIST (verify before responding)
+- [ ] Fix addresses the root cause, not just the symptom
+- [ ] No security vulnerabilities introduced
+- [ ] No breaking changes to function signatures/returns
+- [ ] Code follows existing patterns in the file
 
 RESPOND WITH JSON ONLY:
 {{
     "fixes": [
         {{
             "file_path": "{analysis.file_path}",
-            "original_code": "exact code to replace (include enough context to be unique)",
-            "fixed_code": "corrected code",
-            "explanation": "why this fixes it",
-            "confidence": 0.0 to 1.0
+            "original_code": "exact code to replace (include enough surrounding context to be unique in the file)",
+            "fixed_code": "corrected code with same formatting/indentation",
+            "explanation": "CTO explanation of why this fix is safe and correct",
+            "confidence": 0.0 to 1.0,
+            "risk_notes": "any risks or edge cases to be aware of"
         }}
     ]
 }}
-
-Make the SMALLEST change that fixes the issue. Do NOT refactor other code.
 """
 
         response = await self._call_claude(prompt)
@@ -492,7 +547,10 @@ Make the SMALLEST change that fixes the issue. Do NOT refactor other code.
         branch_name = f"autofix/{fix_attempt.sentry_event_id[:12]}"
 
         async with httpx.AsyncClient() as client:
-            headers = {"Authorization": f"Bearer {self.config.github_token}"}
+            headers = {
+                "Authorization": f"Bearer {self.config.github_token}",
+                "Accept": "application/vnd.github.v3+json",
+            }
 
             # Get default branch SHA
             repo_resp = await client.get(
@@ -500,6 +558,10 @@ Make the SMALLEST change that fixes the issue. Do NOT refactor other code.
                 headers=headers,
                 timeout=30.0,
             )
+            if repo_resp.status_code != 200:
+                logger.error(f"Failed to get repo info: {repo_resp.status_code} - {repo_resp.text}")
+                return None, None
+
             default_branch = repo_resp.json().get("default_branch", "main")
 
             ref_resp = await client.get(
@@ -507,6 +569,10 @@ Make the SMALLEST change that fixes the issue. Do NOT refactor other code.
                 headers=headers,
                 timeout=30.0,
             )
+            if ref_resp.status_code != 200:
+                logger.error(f"Failed to get branch ref: {ref_resp.status_code} - {ref_resp.text}")
+                return None, None
+
             base_sha = ref_resp.json()["object"]["sha"]
 
             # Create branch
@@ -595,31 +661,93 @@ Make the SMALLEST change that fixes the issue. Do NOT refactor other code.
 🤖 *Generated by AutoFix Agent*
 """
 
+    async def _merge_pr(self, pr_number: int, user_name: str) -> bool:
+        """Merge a PR to deploy the fix."""
+        async with httpx.AsyncClient() as client:
+            headers = {
+                "Authorization": f"Bearer {self.config.github_token}",
+                "Accept": "application/vnd.github.v3+json",
+            }
+
+            merge_resp = await client.put(
+                f"https://api.github.com/repos/{self.config.github_repo}/pulls/{pr_number}/merge",
+                headers=headers,
+                json={
+                    "commit_title": f"[AutoFix] Deploy fix (approved by {user_name})",
+                    "merge_method": "squash",
+                },
+                timeout=30.0,
+            )
+
+            if merge_resp.status_code == 200:
+                return True
+            else:
+                logger.error(f"Failed to merge PR #{pr_number}: {merge_resp.status_code} - {merge_resp.text}")
+                return False
+
     # -------------------------------------------------------------------------
     # Slack Integration
     # -------------------------------------------------------------------------
 
     async def _send_slack_notification(self, fix_attempt: FixAttempt) -> None:
-        """Send fix proposal to Slack."""
+        """Send CTO-analyzed fix proposal to Slack."""
         if not fix_attempt.error_analysis:
             return
 
         analysis = fix_attempt.error_analysis
+
+        # Header changes based on whether PR was created
+        if fix_attempt.pr_url:
+            header_text = "🔧 AutoFix: CTO Review Complete - Ready to Deploy"
+        elif fix_attempt.status == FixStatus.FAILED:
+            header_text = "⚠️ AutoFix: Analysis Failed"
+        elif not analysis.can_auto_fix:
+            header_text = "🔍 AutoFix: Manual Review Required"
+        else:
+            header_text = "🔧 AutoFix: Error Detected"
+
+        # Security/risk emoji indicators
+        security_emoji = {"none": "✅", "low": "🟡", "medium": "🟠", "high": "🔴"}.get(analysis.security_implications, "❓")
+        complexity_emoji = {"minimal": "🟢", "simple": "🟢", "standard": "🟡", "complex": "🔴"}.get(analysis.complexity, "❓")
+
         blocks = [
-            {"type": "header", "text": {"type": "plain_text", "text": "🔧 AutoFix: Error Detected", "emoji": True}},
+            {"type": "header", "text": {"type": "plain_text", "text": header_text, "emoji": True}},
             {
                 "type": "section",
                 "fields": [
                     {"type": "mrkdwn", "text": f"*Error:*\n`{analysis.error_type}`"},
-                    {"type": "mrkdwn", "text": f"*Confidence:*\n{analysis.confidence:.0%}"},
-                    {"type": "mrkdwn", "text": f"*File:*\n`{analysis.file_path}`"},
-                    {"type": "mrkdwn", "text": f"*Line:*\n{analysis.line_number or 'N/A'}"},
+                    {"type": "mrkdwn", "text": f"*File:*\n`{analysis.file_path}:{analysis.line_number or '?'}`"},
                 ],
             },
-            {"type": "section", "text": {"type": "mrkdwn", "text": f"*Message:*\n```{analysis.error_message[:400]}```"}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"*Message:*\n```{analysis.error_message[:300]}```"}},
             {"type": "divider"},
+            # CTO Analysis section
+            {"type": "section", "text": {"type": "mrkdwn", "text": "*📊 CTO Analysis*"}},
+            {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*Complexity:*\n{complexity_emoji} {analysis.complexity.title()}"},
+                    {"type": "mrkdwn", "text": f"*Security:*\n{security_emoji} {analysis.security_implications.title()}"},
+                    {"type": "mrkdwn", "text": f"*Blast Radius:*\n{analysis.blast_radius.title()}"},
+                    {"type": "mrkdwn", "text": f"*Confidence:*\n{analysis.confidence:.0%}"},
+                ],
+            },
             {"type": "section", "text": {"type": "mrkdwn", "text": f"*🔍 Root Cause:*\n{analysis.root_cause}"}},
         ]
+
+        # Add CTO recommendation if present
+        if analysis.recommendation:
+            blocks.append({
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"*💡 CTO Recommendation:*\n{analysis.recommendation}"},
+            })
+
+        # Add PR link if created
+        if fix_attempt.pr_url:
+            blocks.append({
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"*📋 Pull Request:* <{fix_attempt.pr_url}|PR #{fix_attempt.pr_number}>"},
+            })
 
         # Add fixes
         for fix in fix_attempt.proposed_fixes:
@@ -629,14 +757,19 @@ Make the SMALLEST change that fixes the issue. Do NOT refactor other code.
                 {"type": "section", "text": {"type": "mrkdwn", "text": f"```diff\n- {fix.original_code[:300]}\n+ {fix.fixed_code[:300]}```"}},
             ])
 
-        # Add buttons if awaiting approval
-        if fix_attempt.status == FixStatus.AWAITING_APPROVAL:
+        # Add deploy buttons if PR is ready
+        if fix_attempt.status == FixStatus.AWAITING_APPROVAL and fix_attempt.pr_url:
             blocks.append({
                 "type": "actions",
                 "elements": [
-                    {"type": "button", "text": {"type": "plain_text", "text": "✅ Authorize Fix"}, "style": "primary", "action_id": "autofix_approve", "value": fix_attempt.id},
-                    {"type": "button", "text": {"type": "plain_text", "text": "❌ Dismiss"}, "style": "danger", "action_id": "autofix_reject", "value": fix_attempt.id},
+                    {"type": "button", "text": {"type": "plain_text", "text": "🚀 Deploy Live", "emoji": True}, "style": "primary", "action_id": "autofix_approve", "value": fix_attempt.id},
+                    {"type": "button", "text": {"type": "plain_text", "text": "❌ Dismiss", "emoji": True}, "style": "danger", "action_id": "autofix_reject", "value": fix_attempt.id},
                 ],
+            })
+        elif fix_attempt.status == FixStatus.FAILED:
+            blocks.append({
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"*❌ Error:* {fix_attempt.failure_reason}"},
             })
 
         async with httpx.AsyncClient() as client:
@@ -648,16 +781,18 @@ Make the SMALLEST change that fixes the issue. Do NOT refactor other code.
 
     async def _send_slack_result(self, fix_attempt: FixAttempt, response_url: Optional[str]) -> None:
         """Send result notification to Slack."""
-        if fix_attempt.pr_url:
-            text = f"✅ *PR Created:* <{fix_attempt.pr_url}|View PR #{fix_attempt.pr_number}>"
+        if fix_attempt.status == FixStatus.DEPLOYED:
+            text = f"🚀 *Deployed!* PR #{fix_attempt.pr_number} merged and deploying now. <{fix_attempt.pr_url}|View PR>"
         elif fix_attempt.status == FixStatus.REJECTED:
-            text = "❌ *Fix Rejected*"
-        else:
+            text = f"❌ *Dismissed* - PR remains open: <{fix_attempt.pr_url}|PR #{fix_attempt.pr_number}>"
+        elif fix_attempt.status == FixStatus.FAILED:
             text = f"⚠️ *Failed:* {fix_attempt.failure_reason}"
+        else:
+            text = f"✅ *PR Ready:* <{fix_attempt.pr_url}|View PR #{fix_attempt.pr_number}>"
 
         url = response_url or self.config.slack_webhook_url
         async with httpx.AsyncClient() as client:
-            await client.post(url, json={"text": text}, timeout=10.0)
+            await client.post(url, json={"text": text, "replace_original": "true"}, timeout=10.0)
 
     # -------------------------------------------------------------------------
     # Helpers
@@ -750,7 +885,7 @@ Make the SMALLEST change that fixes the issue. Do NOT refactor other code.
             return None
 
     def _parse_analysis(self, response: str, event_data: SentryEventData) -> ErrorAnalysis:
-        """Parse Claude's analysis response."""
+        """Parse Claude's CTO analysis response."""
         try:
             match = re.search(r"\{[\s\S]*\}", response)
             if match:
@@ -765,6 +900,11 @@ Make the SMALLEST change that fixes the issue. Do NOT refactor other code.
                     confidence=float(data.get("confidence", 0.5)),
                     can_auto_fix=data.get("can_auto_fix", False),
                     explanation=data.get("explanation", ""),
+                    # CTO/Orchestrator fields
+                    complexity=data.get("complexity", "simple"),
+                    security_implications=data.get("security_implications", "none"),
+                    blast_radius=data.get("blast_radius", "isolated"),
+                    recommendation=data.get("recommendation"),
                 )
         except Exception as e:
             logger.warning(f"Failed to parse analysis: {e}")
@@ -777,6 +917,9 @@ Make the SMALLEST change that fixes the issue. Do NOT refactor other code.
             confidence=0.0,
             can_auto_fix=False,
             explanation="Failed to analyze",
+            complexity="unknown",
+            security_implications="unknown",
+            blast_radius="unknown",
         )
 
     def _parse_fixes(self, response: str) -> list[ProposedFix]:

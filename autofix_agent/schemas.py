@@ -15,6 +15,7 @@ class FixStatus(str, Enum):
     AWAITING_APPROVAL = "awaiting_approval"
     APPROVED = "approved"
     PR_CREATED = "pr_created"
+    DEPLOYED = "deployed"
     REJECTED = "rejected"
     FAILED = "failed"
     SKIPPED = "skipped"
@@ -51,7 +52,7 @@ class SentryEventData(BaseModel):
 
 
 class ErrorAnalysis(BaseModel):
-    """Analysis result from Claude."""
+    """CTO-level analysis result from Claude."""
 
     error_type: str
     error_message: str
@@ -62,6 +63,11 @@ class ErrorAnalysis(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     can_auto_fix: bool
     explanation: str
+    # CTO/Orchestrator fields
+    complexity: str = "simple"  # minimal, simple, standard, complex
+    security_implications: str = "none"  # none, low, medium, high
+    blast_radius: str = "isolated"  # isolated, moderate, wide
+    recommendation: Optional[str] = None
 
 
 class ProposedFix(BaseModel):
