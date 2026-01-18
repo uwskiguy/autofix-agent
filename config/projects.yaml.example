@@ -1,0 +1,24 @@
+# AutoFix Agent - Project Configuration
+# Copy this file to projects.yaml and customize for your projects
+
+projects:
+  # Example: JunkGems Backend
+  - name: junkgems-backend
+    github_repo: bensharpe/JunkGems
+    github_path: backend/  # Subfolder in the repo where code lives
+    sentry_project: junkgems-backend  # Must match your Sentry project slug
+    slack_channel: "#junkgems-errors"  # Channel for notifications
+
+  # Example: A frontend project
+  # - name: my-frontend
+  #   github_repo: myorg/frontend
+  #   github_path: ""  # Code is at root
+  #   sentry_project: my-frontend
+  #   slack_channel: "#frontend-errors"
+
+  # Example: Monorepo with multiple services
+  # - name: api-service
+  #   github_repo: myorg/monorepo
+  #   github_path: services/api/
+  #   sentry_project: api-service
+  #   slack_channel: "#api-errors"
