@@ -254,6 +254,7 @@ class AutoFixAgent:
             status=FixStatus.PENDING,
             sentry_event_id=event_data.event_id,
             github_repo=self.config.github_repo,
+            project_name=event_data.project or self.config.github_repo,
         )
         self._fix_attempts[attempt_id] = fix_attempt
 
@@ -695,16 +696,17 @@ RESPOND WITH JSON ONLY:
             return
 
         analysis = fix_attempt.error_analysis
+        project_display = fix_attempt.project_name or self.config.github_repo
 
         # Header changes based on whether PR was created
         if fix_attempt.pr_url:
-            header_text = "🔧 AutoFix: CTO Review Complete - Ready to Deploy"
+            header_text = f"🔧 [{project_display}] CTO Review Complete - Ready to Deploy"
         elif fix_attempt.status == FixStatus.FAILED:
-            header_text = "⚠️ AutoFix: Analysis Failed"
+            header_text = f"⚠️ [{project_display}] Analysis Failed"
         elif not analysis.can_auto_fix:
-            header_text = "🔍 AutoFix: Manual Review Required"
+            header_text = f"🔍 [{project_display}] Manual Review Required"
         else:
-            header_text = "🔧 AutoFix: Error Detected"
+            header_text = f"🔧 [{project_display}] Error Detected"
 
         # Security/risk emoji indicators
         security_emoji = {"none": "✅", "low": "🟡", "medium": "🟠", "high": "🔴"}.get(analysis.security_implications, "❓")
@@ -715,6 +717,7 @@ RESPOND WITH JSON ONLY:
             {
                 "type": "section",
                 "fields": [
+                    {"type": "mrkdwn", "text": f"*Project:*\n`{project_display}`"},
                     {"type": "mrkdwn", "text": f"*Error:*\n`{analysis.error_type}`"},
                     {"type": "mrkdwn", "text": f"*File:*\n`{analysis.file_path}:{analysis.line_number or '?'}`"},
                 ],
@@ -775,20 +778,21 @@ RESPOND WITH JSON ONLY:
         async with httpx.AsyncClient() as client:
             await client.post(
                 self.config.slack_webhook_url,
-                json={"blocks": blocks, "text": f"AutoFix: {analysis.error_type}"},
+                json={"blocks": blocks, "text": f"[{project_display}] AutoFix: {analysis.error_type}"},
                 timeout=10.0,
             )
 
     async def _send_slack_result(self, fix_attempt: FixAttempt, response_url: Optional[str]) -> None:
         """Send result notification to Slack."""
+        project_display = fix_attempt.project_name or self.config.github_repo
         if fix_attempt.status == FixStatus.DEPLOYED:
-            text = f"🚀 *Deployed!* PR #{fix_attempt.pr_number} merged and deploying now. <{fix_attempt.pr_url}|View PR>"
+            text = f"🚀 *[{project_display}] Deployed!* PR #{fix_attempt.pr_number} merged and deploying now. <{fix_attempt.pr_url}|View PR>"
         elif fix_attempt.status == FixStatus.REJECTED:
-            text = f"❌ *Dismissed* - PR remains open: <{fix_attempt.pr_url}|PR #{fix_attempt.pr_number}>"
+            text = f"❌ *[{project_display}] Dismissed* - PR remains open: <{fix_attempt.pr_url}|PR #{fix_attempt.pr_number}>"
         elif fix_attempt.status == FixStatus.FAILED:
-            text = f"⚠️ *Failed:* {fix_attempt.failure_reason}"
+            text = f"⚠️ *[{project_display}] Failed:* {fix_attempt.failure_reason}"
         else:
-            text = f"✅ *PR Ready:* <{fix_attempt.pr_url}|View PR #{fix_attempt.pr_number}>"
+            text = f"✅ *[{project_display}] PR Ready:* <{fix_attempt.pr_url}|View PR #{fix_attempt.pr_number}>"
 
         url = response_url or self.config.slack_webhook_url
         async with httpx.AsyncClient() as client:
